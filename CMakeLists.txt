@@ -11,6 +11,7 @@ find_package(TBB REQUIRED)
 gaudi_add_module(ML4FPSGaudiPlugins
   SOURCES
     src/PixelHitBDTAlg.cpp
+    src/PixelHitBDTTestAlg.cpp
   LINK
     Gaudi::GaudiKernel
     k4FWCore::k4FWCore
