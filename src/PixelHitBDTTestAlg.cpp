@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 #include <tbb/blocked_range.h>
@@ -90,6 +91,11 @@ StatusCode PixelHitBDTTestAlg::initialize() {
     m_numThreads = 1;
   }
 
+  if (m_debugRelationLogStride.value() < 1) {
+    warning() << "DebugRelationLogStride must be >= 1. Forcing DebugRelationLogStride = 1." << endmsg;
+    m_debugRelationLogStride = 1;
+  }
+
   auto reader = std::make_unique<TMVA::Reader>("!Color:!Silent");
   std::array<float, kNVars> initVars{};
   bindReaderVariables(*reader, initVars);
@@ -103,6 +109,9 @@ StatusCode PixelHitBDTTestAlg::initialize() {
   }
 
   info() << "Initialized PixelHitBDTTestAlg with weights file: " << m_weightsFile.value() << endmsg;
+  info() << "Relation debug: enabled=" << (m_debugRelationScan.value() ? "true" : "false")
+         << ", logEveryAccess=" << (m_debugRelationLogEveryAccess.value() ? "true" : "false")
+         << ", stride=" << m_debugRelationLogStride.value() << endmsg;
   return StatusCode::SUCCESS;
 }
 
@@ -113,61 +122,97 @@ PixelHitBDTTestAlg::operator()(const edm4hep::TrackerHitPlaneCollection& inputHi
                                const edm4hep::TrackerHitSimTrackerHitLinkCollection& truthRelations,
                                const edm4hep::SimTrackerHitCollection& truthSimHits) const {
   using HitKey = std::pair<uint32_t, int32_t>;
-  using RelRange = std::pair<std::size_t, std::size_t>;
+  struct HitKeyHash {
+    std::size_t operator()(const HitKey& key) const noexcept {
+      return (static_cast<std::size_t>(key.first) << 32) ^ static_cast<uint32_t>(key.second);
+    }
+  };
 
   const auto makeKey = [](const podio::ObjectID& id) { return HitKey{id.collectionID, id.index}; };
-
-  const auto buildRelationRanges = [&](const edm4hep::TrackerHitSimTrackerHitLinkCollection& relations) {
-    std::vector<RelRange> relationRanges(inputHits.size(), {0, 0});
-    std::size_t relationCursor = 0;
-    for (std::size_t iHit = 0; iHit < inputHits.size(); ++iHit) {
-      const HitKey hitKey = makeKey(inputHits[iHit].id());
-
-      while (relationCursor < relations.size()) {
-        const HitKey relFromKey = makeKey(relations[relationCursor].getFrom().id());
-        if (relFromKey < hitKey) {
-          ++relationCursor;
-          continue;
-        }
-        break;
-      }
-
-      const std::size_t begin = relationCursor;
-      while (relationCursor < relations.size() && makeKey(relations[relationCursor].getFrom().id()) == hitKey) {
-        ++relationCursor;
-      }
-      relationRanges[iHit] = {begin, relationCursor};
-    }
-    return relationRanges;
+  const bool debugRelations = m_debugRelationScan.value();
+  const bool logEveryAccess = m_debugRelationLogEveryAccess.value();
+  const std::size_t logStride = static_cast<std::size_t>(std::max(1, m_debugRelationLogStride.value()));
+  const auto shouldLogRelation = [&](std::size_t iRel) {
+    return debugRelations && (logEveryAccess || (iRel % logStride == 0));
   };
 
   const std::size_t nHits = inputHits.size();
-  const auto rawRanges = buildRelationRanges(rawHitRelations);
 
-  // Truth matching is expected to be 1:1 with contiguous hit IDs [0, nHits).
+  if (debugRelations) {
+    info() << "[DBG] operator() entry: nHits=" << nHits << ", inputHits.getID()=" << inputHits.getID()
+           << ", rawRelSize=" << rawHitRelations.size() << ", rawSimSize=" << rawSimHits.size()
+           << ", truthRelSize=" << truthRelations.size() << ", truthSimSize=" << truthSimHits.size() << endmsg;
+  }
+
+  // Keep lookups robust for subset collections and non-contiguous ObjectIDs.
+  std::unordered_map<HitKey, std::size_t, HitKeyHash> hitIndexById;
+  hitIndexById.reserve(nHits);
+  for (std::size_t iHit = 0; iHit < nHits; ++iHit) {
+    hitIndexById.emplace(makeKey(inputHits[iHit].id()), iHit);
+  }
+
+  const auto buildRelationBuckets = [&](const edm4hep::TrackerHitSimTrackerHitLinkCollection& relations,
+                                        const char* relationName) {
+    if (debugRelations) {
+      info() << "[DBG] building buckets for " << relationName << ", relationCount=" << relations.size() << endmsg;
+    }
+
+    std::vector<std::vector<std::size_t>> buckets(nHits);
+    for (std::size_t iRel = 0; iRel < relations.size(); ++iRel) {
+      if (shouldLogRelation(iRel)) {
+        info() << "[DBG] " << relationName << " getFrom() iRel=" << iRel << endmsg;
+      }
+
+      const auto fromObj = relations[iRel].getFrom();
+      if (debugRelations && !fromObj.isAvailable()) {
+        warning() << "[DBG] " << relationName << " from object not available at iRel=" << iRel << endmsg;
+        continue;
+      }
+
+      const auto fromIt = hitIndexById.find(makeKey(fromObj.id()));
+      if (fromIt == hitIndexById.end()) {
+        if (shouldLogRelation(iRel)) {
+          const auto fromId = fromObj.id();
+          info() << "[DBG] " << relationName << " relation not matched to current inputHits at iRel=" << iRel
+                 << " (from.collectionID=" << fromId.collectionID << ", from.index=" << fromId.index << ")"
+                 << endmsg;
+        }
+        continue;
+      }
+      buckets[fromIt->second].push_back(iRel);
+    }
+
+    if (debugRelations) {
+      info() << "[DBG] finished bucket build for " << relationName << endmsg;
+    }
+
+    return buckets;
+  };
+
+  const auto rawRelationBuckets = buildRelationBuckets(rawHitRelations, "rawHitRelations");
+  const auto truthRelationBuckets = buildRelationBuckets(truthRelations, "truthRelations");
+
+  // Truth labels are keyed by TrackerHit ObjectID and relation target availability.
   std::vector<float> truthLabels(nHits, 0.0f);
-  for (const auto& rel : truthRelations) {
-    const auto fromID = rel.getFrom().id();
-    if (fromID.collectionID != inputHits.getID() || fromID.index < 0) {
-      continue;
-    }
+  for (std::size_t iHit = 0; iHit < nHits; ++iHit) {
+    for (const std::size_t iRel : truthRelationBuckets[iHit]) {
+      if (shouldLogRelation(iRel)) {
+        info() << "[DBG] truth getTo() iHit=" << iHit << ", iRel=" << iRel << endmsg;
+      }
 
-    const std::size_t iHit = static_cast<std::size_t>(fromID.index);
-    if (iHit >= nHits) {
-      continue;
-    }
+      const auto truthHit = truthRelations[iRel].getTo();
+      if (!truthHit.isAvailable()) {
+        if (shouldLogRelation(iRel)) {
+          warning() << "[DBG] truth getTo() unavailable at iHit=" << iHit << ", iRel=" << iRel << endmsg;
+        }
+        continue;
+      }
 
-    const auto toID = rel.getTo().id();
-    bool isOverlay = true;
-    if (toID.index >= 0 && toID.collectionID == truthSimHits.getID() && static_cast<std::size_t>(toID.index) < truthSimHits.size()) {
-      isOverlay = truthSimHits[static_cast<std::size_t>(toID.index)].isOverlay();
-    } else if (rel.getTo().isAvailable()) {
-      isOverlay = rel.getTo().isOverlay();
-    }
-
-    // Label is 1 for non-overlay truth (signal-like), 0 for overlay/BIB.
-    if (!isOverlay) {
-      truthLabels[iHit] = 1.0f;
+      // Label is 1 for non-overlay truth (signal-like), 0 for overlay/BIB.
+      if (!truthHit.isOverlay()) {
+        truthLabels[iHit] = 1.0f;
+        break;
+      }
     }
   }
 
@@ -200,23 +245,16 @@ PixelHitBDTTestAlg::operator()(const edm4hep::TrackerHitPlaneCollection& inputHi
     for (std::size_t iHit = r.begin(); iHit != r.end(); ++iHit) {
       rawHits.clear();
 
-      const auto [rawBegin, rawEnd] = rawRanges[iHit];
-      for (std::size_t iRel = rawBegin; iRel < rawEnd; ++iRel) {
-        const auto& rel = rawHitRelations[iRel];
-        const auto toID = rel.getTo().id();
-        if (toID.index < 0) {
-          continue;
+      for (const std::size_t iRel : rawRelationBuckets[iHit]) {
+        if (shouldLogRelation(iRel)) {
+          info() << "[DBG] raw getTo() iHit=" << iHit << ", iRel=" << iRel << endmsg;
         }
 
-        edm4hep::SimTrackerHit simHit;
-        if (toID.collectionID == rawSimHits.getID() && static_cast<std::size_t>(toID.index) < rawSimHits.size()) {
-          simHit = rawSimHits[static_cast<std::size_t>(toID.index)];
-        } else if (rel.getTo().isAvailable()) {
-          simHit = rel.getTo();
-        }
-
+        const auto simHit = rawHitRelations[iRel].getTo();
         if (simHit.isAvailable()) {
           rawHits.push_back(simHit);
+        } else if (shouldLogRelation(iRel)) {
+          warning() << "[DBG] raw getTo() unavailable at iHit=" << iHit << ", iRel=" << iRel << endmsg;
         }
       }
 
