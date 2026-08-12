@@ -74,4 +74,11 @@ private:
     this, "MinBdtScore", 0.0f, "Minimum BDT score required to keep a hit in OutputScoredHitCollection"};
   Gaudi::Property<int> m_numThreads{
     this, "NumThreads", 1, "Number of threads for per-hit BDT evaluation"};
+
+  Gaudi::Property<bool> m_debugRelationScan{
+    this, "DebugRelationScan", false};
+  Gaudi::Property<bool> m_debugRelationLogEveryAccess{
+    this, "DebugRelationLogEveryAccess", false};
+  Gaudi::Property<int> m_debugRelationLogStride{
+    this, "DebugRelationLogStride", 1};
 };
